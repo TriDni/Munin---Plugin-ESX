@@ -1,0 +1,62 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Munin::Plugin;
+use Storable;
+
+###Vérification de la mise à jour du fichier
+my $esx = $ENV{address} || undef;
+my $user = $ENV{user} || "administrateur"; 
+my $password = $ENV{password} || "qlsat";
+my $path = $ENV{path} || "/tmp/";
+my $file_path = $path."dump_time_".$esx.".dump";
+my $time_lock_path = $path."dump_time_".$esx.".lock";
+my $host_lock_path = $path."dump_host_".$esx.".lock";
+my $vm_lock_path = $path."dump_vm_".$esx.".lock";
+my $datastore_lock_path = $path."dump_datastore_".$esx.".lock";
+my $script_path = $ENV{collector} || "/home/stagiaire/PluginsESX/";
+my $hostname = $ENV{hostname} || undef;
+
+if (-e $file_path && ((time - (`stat -c %Y $file_path`)) >= 300)) {#300 (secondes) correspond à 5 minutes d'age maximal
+  system("perl ".$script_path."get_ressource_esx --address '$esx' --user '$user' --password '$password' --default-path '$path'");
+	while (-e $time_lock_path && !-e $file_path) {
+		sleep 1;
+		}
+	} 
+if (!-e $file_path && !-e $time_lock_path) {
+	system("perl ".$script_path."get_ressource_esx --address '$esx' --user '$user' --password '$password' --default-path '$path'");
+        while (-e $time_lock_path && !-e $file_path) {
+                sleep 1;
+                }
+	}
+if (-e $time_lock_path) {
+        system("perl ".$script_path."get_ressource_esx --address '$esx' --user '$user' --password '$password' --force --default-path '$path'");
+        while (-e $time_lock_path && -e $vm_lock_path && -e $datastore_lock_path && -e $host_lock_path && !-e $file_path) {
+                sleep 1;
+                }
+        }
+
+my $values = retrieve($file_path);
+
+######Exemple - Structure######
+###Consommation CPU (MHz)###
+
+if ( exists $ARGV[0] and $ARGV[0] eq "config" ) {
+	if (defined $hostname) { print "host_name ".$hostname."\n"; }
+        print "graph_title ESX VCenter Request Latency (ms)\n";
+        print "graph_vlabel Request Latency (ms)\n";
+        print "graph_category VCenter\n";
+        print "graph_args --base 1000 -l 0\n";
+
+	print "vcenter.label VCenter - ".$esx."\n";
+        }
+else {
+        foreach my $vm (keys $values){
+                print "vcenter.value ".${$values}{$vm}."\n";
+                }
+
+}
+
+
