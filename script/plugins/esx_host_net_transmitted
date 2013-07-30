@@ -1,0 +1,142 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Munin::Plugin;
+use Storable;
+
+###Vérification de la mise à jour du fichier
+my $esx = $ENV{address} || undef;
+my $user = $ENV{user} || "administrateur"; 
+my $password = $ENV{password} || "qlsat";
+my $path = $ENV{path} || "/tmp/";
+my $file_path = $path."dump_host_".$esx.".dump";
+my $host_lock_path = $path."dump_host_".$esx.".lock";
+my $vm_lock_path = $path."dump_vm_".$esx.".lock";
+my $datastore_lock_path = $path."dump_datastore_".$esx.".lock";
+my $script_path = $ENV{collector} || "/home/stagiaire/PluginsESX/";
+my $host = $ENV{host} || undef;
+my $cluster = $ENV{cluster} || undef;
+my $hostname = $ENV{hostname} || undef;
+my $vmnic_env = $ENV{vmnic} || undef;
+
+if (-e $file_path && ((time - (`stat -c %Y $file_path`)) >= 300)) {#300 (secondes) correspond à 5 minutes d'age maximal
+  system("perl ".$script_path."get_ressource_esx --address '$esx' --user '$user' --password '$password' --default-path '$path'");
+	while (-e $host_lock_path && !-e $file_path) {
+		sleep 1;
+		}
+	} 
+if (!-e $file_path && !-e $host_lock_path) {
+	system("perl ".$script_path."get_ressource_esx --address '$esx' --user '$user' --password '$password' --default-path '$path'");
+        while (-e $host_lock_path && !-e $file_path) {
+                sleep 1;
+                }
+	}
+if (-e $host_lock_path) {
+        system("perl ".$script_path."get_ressource_esx --address '$esx' --user '$user' --password '$password' --force --default-path '$path'");
+        while (-e $vm_lock_path && -e $datastore_lock_path && -e $host_lock_path && !-e $file_path) {
+                sleep 1;
+                }
+        }
+
+my $values = retrieve($file_path);
+
+######Exemple - Structure######
+###Consommation Memoire Consommée  ###
+
+if ( exists $ARGV[0] and $ARGV[0] eq "config" ) {
+	if (defined $hostname) { print "host_name ".$hostname."\n"; }
+	print "graph_title ".graph_title($cluster, $host, $vmnic_env)." ESX Host Net Transmitted\n";
+        print "graph_vlabel Net Transmitted (bytes/s)\n";
+        print "graph_category network\n";
+	print "graph_args --base 1024 -l 0\n";
+	
+        my @tablabel;
+        foreach my $vm (@$values) {
+		if (${$vm}{nettransmitted} eq "NaN" ) {
+                        push (@tablabel, ${$vm}{cluster}." - ".${$vm}{name}." - All,".${$vm}{id}."-novmnic.label ");
+                        }
+                else {
+		foreach my $vmnic (keys ${$vm}{nettransmitted}) {
+			if (filter($vmnic_env, ${$vm}{nettransmitted}[$vmnic]{id}, $host, ${$vm}{name}, $cluster, ${$vm}{cluster}) == 1) {
+				push (@tablabel, ${$vm}{cluster}." - ".${$vm}{name}." - ".${$vm}{nettransmitted}[$vmnic]{id}.",".${$vm}{id}."-".${$vm}{nettransmitted}[$vmnic]{id}.".label ");
+				}	
+			}
+		}
+		}
+	foreach my $label (sort @tablabel) {
+                my @words = split(/,/, $label);
+                print $words[1].$words[0]."\n";
+                }
+        }
+else {
+	foreach my $vm (@$values) {
+                if (${$vm}{nettransmitted} eq "NaN" ) {
+                        print ${$vm}{id}."-novmnic.value NaN\n";
+                        }
+                else {
+		foreach my $vmnic (keys ${$vm}{nettransmitted}) {
+                        if (filter($vmnic_env, ${$vm}{nettransmitted}[$vmnic]{id}, $host, ${$vm}{name}, $cluster, ${$vm}{cluster}) == 1) {
+                                print ${$vm}{id}."-".${$vm}{nettransmitted}[$vmnic]{id}.".value ".${$vm}{nettransmitted}[$vmnic]{value}."\n";
+				}
+			}
+                }
+		}
+}
+
+sub filter {
+	my ($vmnic, $vmnic_val, $host, $host_val, $cluster, $cluster_val) = @_;
+	my $return = 0;
+
+	if (defined $vmnic && ($vmnic eq $vmnic_val)) {
+		if (!defined $host && !defined $cluster) {
+			$return = 1;
+			}
+		elsif (defined $host && !defined $cluster && ($host eq $host_val)) {
+			$return = 1;
+			}
+		elsif (defined $cluster && ($cluster eq $cluster_val)) {
+			if (defined $host && ($host eq $host_val)) {
+				$return = 1;
+				}
+			else {
+				$return = 1;
+				}
+			}
+		}
+	elsif (defined $cluster && !defined $vmnic && ($cluster eq $cluster_val)) {
+		if (defined $host && ($host eq $host_val)) {
+			$return = 1;
+			}
+		else {
+			$return = 1;
+			}
+		}
+	elsif (defined $host && !defined $cluster && !defined $vmnic && ($host eq $host_val)) {
+		$return = 1;
+		}
+	elsif (!defined $host && !defined $cluster && !defined $vmnic) {
+		$return = 1;
+		}	
+	return $return;
+	}
+
+sub graph_title {
+	my ($cluster, $vmnic, $host) = @_;
+	my $result;
+	
+	if (defined $vmnic) {
+                if (defined $result) { $result .= " - ".$vmnic; }
+                else { $result = $vmnic; }
+                }
+	if (defined $host) {
+                if (defined $result) { $result .= " - ".$host; }
+                else { $result = $host; }
+                }
+	if (defined $cluster) {
+		if (defined $result) { $result .= " - ".$cluster; }
+                else { $result = $cluster; }
+		}
+	return $result;
+}
