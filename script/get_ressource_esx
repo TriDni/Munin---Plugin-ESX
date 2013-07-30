@@ -1,0 +1,1075 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use vars qw($PROGNAME $VERSION $output $values $result $defperfargs);
+use File::Basename;
+use HTTP::Date;
+use Data::Dumper;
+use Storable;
+use Getopt::Long;
+use Sys::Syslog qw( :DEFAULT setlogsock);
+use LWP::UserAgent;
+use Net::Ping;
+
+my $optsAddress, my $optsUser, my $optsPassword, my $optsNan, my $optsRefresh, my $optsPathDatastore, my $optsPathVm, my $optsPathHost;
+my $optsLinkCounterId, my $optsLinkHost, my $optsLinkHostCluster, my $optsLinkVm, my $optsLinkVmCluster, my $optsLinkVmHost;
+my @optsHostArg, my @optsVmArg, my @optsDatastoreArg, my $optsHelp, my $optsForce, my $optsDefaultPath, my $optsPathTime, my $optsPathLog;
+my $optsLogOff;
+
+GetOptions ('log-off=s' => \$optsLogOff, 'path-log=s' => \$optsPathLog, 'path-time=s' => \$optsPathTime, 'default-path=s' => \$optsDefaultPath, 'force' => \$optsForce, 'help' => \$optsHelp, 'address=s' => \$optsAddress, 'user=s' => \$optsUser, 'password=s' => \$optsPassword, 'nan=s' => \$optsNan, 'refresh=s' => \$optsRefresh, 'path-datastore=s' => \$optsPathDatastore, 'path-vm=s' => \$optsPathVm, 'path-host=s' => \$optsPathHost, 'counterid=s' => \$optsLinkCounterId, 'link-host=s' => \$optsLinkHost, 'link-host-cluster=s' => \$optsLinkHostCluster, 'link-vm=s' => \$optsLinkVm, 'link-vm-cluster=s' => \$optsLinkVmCluster, 'link-vm-host=s' => \$optsLinkVmHost, 'host-arg=s{,}' => \@optsHostArg, 'vm-arg=s{,}' => \@optsVmArg, 'datastore-arg=s{,}' => \@optsDatastoreArg);
+
+if ($optsHelp) { usage();}#Appelle de l'aide
+
+$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+
+require VMware::VIRuntime;
+
+###information de connexion au VCenter
+if (!defined $optsAddress) { usage(); } 
+my $host_address = $optsAddress;
+if (!defined $optsUser) { usage(); } 
+my $username = $optsUser;
+if (!defined $optsPassword) { usage(); } 
+my $password = $optsPassword;
+
+###variable globale 
+my $NAN = "NaN";
+if (defined $optsNan) { $NAN = $optsNan; } 
+my $refresh_delay = 3600;
+if (defined $optsRefresh && (int($optsRefresh) == $optsRefresh)) { $refresh_delay = $optsRefresh; }
+
+###chemin par défaut si défini
+if ($optsDefaultPath) {
+  $optsPathDatastore = $optsDefaultPath;
+	$optsPathVm = $optsDefaultPath;
+	$optsPathHost = $optsDefaultPath;
+	$optsPathLog = $optsDefaultPath;
+	$optsPathTime = $optsDefaultPath;
+	$optsLinkCounterId = $optsDefaultPath;
+	$optsLinkHost = $optsDefaultPath;
+	$optsLinkHostCluster = $optsDefaultPath;
+	$optsLinkVm = $optsDefaultPath;
+	$optsLinkVmCluster = $optsDefaultPath;
+	$optsLinkVmHost = $optsDefaultPath;
+	}
+
+###chemins des Dumps exportés
+my $dump_log = path_arg($optsPathLog, "dump_log_".$host_address);
+my $dump_datastore = path_arg($optsPathDatastore, "dump_datastore_".$host_address);
+my $dump_vm = path_arg($optsPathVm, "dump_vm_".$host_address);
+my $dump_host = path_arg($optsPathHost, "dump_host_".$host_address);
+my $dump_time = path_arg($optsPathTime, "dump_time_".$host_address);
+my $dump_link_counterId = path_arg($optsLinkCounterId, "dump_link_counterId_".$host_address.".dump");
+my $dump_link_host = path_arg($optsLinkHost, "dump_link_host_".$host_address.".dump");
+my $dump_link_host_cluster = path_arg($optsLinkHostCluster, "dump_link_host_cluster_".$host_address.".dump");
+my $dump_link_vm = path_arg($optsLinkVm, "dump_link_vm_".$host_address.".dump");
+my $dump_link_vm_cluster = path_arg($optsLinkVmCluster, "dump_link_vm_cluster_".$host_address.".dump");
+my $dump_link_vm_host = path_arg($optsLinkVmHost, "dump_link_vm_host_".$host_address.".dump");
+###arguments - éléments à requêter
+my @host_arg = ("cpu", "mem", "net", "cluster");
+if (@optsHostArg) { @host_arg = @optsHostArg; }
+my @vm_arg = ("cpu", "mem", "host", "cluster");
+if (@optsVmArg) { @vm_arg = @optsVmArg; }
+my @datastore_arg = ("state", "perf");#state renvoie l'état des DS (capacité etc.) | perf les données de performances (io/s etc.)
+if (@optsDatastoreArg) { @datastore_arg = @optsDatastoreArg; }
+
+###réécriture de l'ip
+my $address = $host_address;
+$host_address .= ":443" if (index($host_address, ":") == -1);
+$host_address = "https://" . $host_address . "/sdk/webService";
+
+###suppression des anciens fichiers si l'option --force
+if ($optsForce) {
+	cleanup($dump_vm, $dump_host, $dump_datastore, $dump_time, $dump_log, $dump_link_counterId, $dump_link_host, $dump_link_host_cluster, $dump_link_vm, $dump_link_vm_host, $dump_link_vm_cluster);
+	}
+
+###vérification de l'absence de double instanciation du script
+if (-e $dump_vm.".lock") { exit; }
+if (-e $dump_host.".lock") { exit; }
+if (-e $dump_datastore.".lock") { exit; }
+if (-e $dump_time.".lock") { exit; }
+if (-e $dump_log.".lock") { exit; }
+
+###renommage des anciens .dump en .lock
+if (-e $dump_vm.".dump") { rename ($dump_vm.".dump", $dump_vm.".lock"); }
+if (-e $dump_host.".dump") { rename ($dump_host.".dump", $dump_host.".lock"); }
+if (-e $dump_datastore.".dump") { rename ($dump_datastore.".dump", $dump_datastore.".lock"); }
+if (-e $dump_time.".dump") { rename ($dump_time.".dump", $dump_time.".lock"); }
+if (-e $dump_log.".dump") { rename ($dump_log.".dump", $dump_log.".lock"); }
+
+###connexion
+my $ping = Net::Ping->new("tcp", 1);
+if ($ping->ping($address)) {
+        my $ua  = LWP::UserAgent->new();
+        my $req = HTTP::Request->new(GET => "https://".$address);
+        my $res = $ua->request($req);
+        if (${$res}{_rc} == "404") {
+                setlogsock('unix');
+                openlog('ESX_RESSOURCE', '', 'user');
+                syslog('info', "VCENTER:$address:UNREACHABLE");
+                closelog;
+                cleanup($dump_vm, $dump_host, $dump_datastore, $dump_time, $dump_log, $dump_link_counterId, $dump_link_host, $dump_link_host_cluster, $dump_link_vm, $dump_link_vm_host, $dump_link_vm_cluster);
+		exit;
+                }
+        }
+else {
+        setlogsock('unix');
+        openlog('ESX_RESSOURCE', '', 'user');
+        syslog('info', "SERVER:$address:UNREACHABLE");
+        closelog;
+        cleanup($dump_vm, $dump_host, $dump_datastore, $dump_time, $dump_log, $dump_link_counterId, $dump_link_host, $dump_link_host_cluster, $dump_link_vm, $dump_link_vm_host, $dump_link_vm_cluster);
+	exit;
+        }
+
+Util::connect($host_address, $username, $password);
+my $begin = `date +%s.%N`;
+
+###mise à jour du fichier de lien si nécessaire
+if ($optsForce || (dump_refresh($dump_link_counterId, $refresh_delay) == 1)) {store build_link_CounterId(), $dump_link_counterId; }
+if ($optsForce || (dump_refresh($dump_link_host, $refresh_delay) == 1)) {store build_link_host(), $dump_link_host; }
+if ($optsForce || (dump_refresh($dump_link_host_cluster, $refresh_delay) == 1)) {store build_link_host_cluster(), $dump_link_host_cluster; }
+if ($optsForce || (dump_refresh($dump_link_vm, $refresh_delay) == 1)) {store build_link_vm(), $dump_link_vm; }
+if ($optsForce || (dump_refresh($dump_link_vm_cluster, $refresh_delay) == 1)) {store build_link_vm_cluster(), $dump_link_vm_cluster; }
+if ($optsForce || (dump_refresh($dump_link_vm_host, $refresh_delay) == 1)) {store build_link_vm_host(), $dump_link_vm_host; }
+
+###récupération des liens
+my $link_counterId = retrieve($dump_link_counterId);
+my $link_host = retrieve($dump_link_host);
+my $link_host_cluster = retrieve($dump_link_host_cluster);
+my $link_vm = retrieve($dump_link_vm);
+my $link_vm_cluster = retrieve($dump_link_vm_cluster);
+my $link_vm_host = retrieve($dump_link_vm_host);
+
+###Ecriture des objets Host, VM et Datastore dans des fichiers
+store build_datastore(@datastore_arg), $dump_datastore.".lock";
+store build_vm(@vm_arg), $dump_vm.".lock";
+store build_host(@host_arg), $dump_host.".lock";
+
+###récupération des informations pour le traitement log
+my $log;
+if (!defined $optsLogOff) { $log = get_vm_log(); }
+
+###deconnexion
+Util::disconnect();
+my $end = `date +%s.%N`;
+
+###Ecriture dans un fichier du temps de réponse du VCenter (ms)
+my $time = sprintf("%.3f", $end - $begin)*1000;
+my %hashtime = ("time" => $time);
+store \%hashtime, $dump_time.".lock";
+
+###Renommage des .lock en .dump
+rename ($dump_vm.".lock", $dump_vm.".dump");
+rename ($dump_host.".lock", $dump_host.".dump");
+rename ($dump_datastore.".lock", $dump_datastore.".dump");
+rename ($dump_time.".lock", $dump_time.".dump");
+
+###écriture des changements dans syslog
+if (!defined $optsLogOff) {
+	if (-e ($dump_log.".lock")) {
+		my $old_log = retrieve $dump_log.".lock";
+		my %hosttmp;
+		foreach my $i (keys $log){
+			foreach my $j (keys $old_log) {
+				if (${$log}[$i]{id} eq ${$old_log}[$j]{id}) {
+					if (${$log}[$i]{state} ne ${$old_log}[$j]{state}) {#si changement d'état VM (ON/OFF) 
+						my $message = ${$log}[$i]{cluster}.":".${$log}[$i]{name}."(".${$log}[$i]{id}."):changeState:".${$old_log}[$j]{state}."/".${$log}[$i]{state};
+						setlogsock('unix');
+						openlog('ESX_RESSOURCE', '', 'user');
+						syslog('info', $message);
+						closelog;
+						}
+					if (${$log}[$i]{hostid} ne ${$old_log}[$j]{hostid}) {# si changement d'hôte VM
+						my $change;
+						if (${$log}[$i]{state} eq 'poweredOn') { $change = "changeHostOn"; } else { $change = "changeHostOff"; }
+						my $message = ${$log}[$i]{cluster}.":".${$log}[$i]{name}."(".${$log}[$i]{id}."):".$change.":".${$old_log}[$j]{hostname}."(".${$old_log}[$j]{hostid}.")/".${$log}[$i]{hostname}."(".${$log}[$i]{hostid}.")";
+						setlogsock('unix');
+       		                                openlog('ESX_RESSOURCE', '', 'user');
+       	        	                        syslog('info', $message);
+	                                        closelog;
+						}
+					foreach my $key (keys ${$log}[$i]{hoststatus}) {
+						if ((${$log}[$i]{hoststatus}[$key]{hoststatus} ne ${$old_log}[$j]{hoststatus}[$key]{hoststatus}) && (${$log}[$i]{hoststatus}[$key]{hostdesc} ne ${$old_log}[$j]{hoststatus}[$key]{hostdesc})) {#si changement état host (cpu etc.)
+							if (!defined $hosttmp{${$log}[$i]{hostid}}) {
+       		                                 		$hosttmp{${$log}[$i]{hostid}}=${$log}[$i]{hostid};
+								my $message = ${$log}[$i]{cluster}.":".${$log}[$i]{hostname}."(".${$log}[$i]{hostid}."):hostChangeStatus:".${$old_log}[$j]{hoststatus}[$key]{hoststatus}."/".${$log}[$i]{hoststatus}[$key]{hoststatus}."(".${$log}[$i]{hoststatus}[$key]{hostdesc}.")";
+	                                        		setlogsock('unix');
+	                                        		openlog('ESX_RESSOURCE', '', 'user');
+	                                        		syslog('info', $message);
+	                                        		closelog;
+								}
+							}
+	                                        }
+					foreach my $key (keys ${$log}[$i]{status}) {
+	                                        if ((${$log}[$i]{status}[$key]{vmstatus} ne ${$old_log}[$j]{status}[$key]{vmstatus}) && (${$log}[$i]{status}[$key]{vmdesc} ne ${$old_log}[$j]{status}[$key]{vmdesc})) {#si changement état vm (cpu, memory etc.)
+	                                                my $message = ${$log}[$i]{cluster}.":".${$log}[$i]{name}."(".${$log}[$i]{id}."):vmChangeStatus:".${$old_log}[$j]{status}[$key]{vmstatus}."/".${$log}[$i]{status}[$key]{vmstatus}."(".${$log}[$i]{status}[$key]{vmdesc}.")";
+	                                                setlogsock('unix');
+	                                                openlog('ESX_RESSOURCE', '', 'user');
+	                                                syslog('info', $message);
+	                                                closelog;
+							}
+	                                        }
+					}
+				}
+			}
+		}
+
+###écriture du fichier de lien (vm - host)
+store $log, $dump_log.".lock";
+
+rename ($dump_log.".lock", $dump_log.".dump");
+	}
+
+
+sub build_vm {
+	
+	my (@arg) = @_;
+	my $perfMgr = Vim::get_view(mo_ref => Vim::get_service_content()->perfManager, properties => [ 'perfCounter' ]);
+	my $views_vm = Vim::find_entity_views(view_type => 'VirtualMachine', filter => {'runtime.powerState' => 'poweredOn'}, properties => [ 'name', 'runtime.host' ]);
+	my @perf_query_spec = ();
+
+	if ("@arg" =~ /cpu/) { 
+		push(@perf_query_spec, PerfQuerySpec->new(entity => $_, metricId => get_ressource($perfMgr, 'cpu', ('usagemhz.average', 'usage.average')), format => 'csv', intervalId => 20, maxSample => 1)) foreach (@$views_vm); 
+		}
+        if ("@arg" =~ /mem/) {
+		push(@perf_query_spec, PerfQuerySpec->new(entity => $_, metricId => get_ressource($perfMgr, 'mem', ('consumed.average', 'swapped.average')), format => 'csv', intervalId => 20, maxSample => 1)) foreach (@$views_vm);
+		}
+
+	my $perf_data, my %tabcpuhz, my %tabcpupercent, my %tabmemmb, my %tabmemswap;
+
+	if (("@arg" =~ /cpu/) || ("@arg" =~ /mem/)) {
+		$perf_data = $perfMgr->QueryPerf(querySpec => \@perf_query_spec);       
+		}
+ 
+	if ("@arg" =~ /cpu/) {
+###		%tabcpuhz;
+		foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'vmCpuHz'}) {
+					$tabcpuhz{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+					}
+				}
+			}
+###		%tabcpupercent;
+		foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'vmCpuPercent'}) {
+					$tabcpupercent{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};	
+					}
+				}
+			}
+		}
+
+	if ("@arg" =~ /mem/) {
+###		%tabmemmb;
+		foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'vmRamConsumed'}){
+               	        		$tabmemmb{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value}; 
+                			}
+				}
+			}
+###		%tabmemswap;
+        	foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'vmRamSwapped'}){
+                       			$tabmemswap{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};     
+                       			}
+				}
+                	}
+		}
+
+	my @obj;
+	foreach my $i (keys($link_vm)) {
+		my $obj_id = $i;
+		my $obj_ip = check(${$link_vm}{$i});
+		my $obj_cpuhz, my $obj_cpupercent, my $obj_host, my $obj_memmb, my $obj_memswap, my $obj_cluster;
+
+	        if ("@arg" =~ /cpu/) {
+			$obj_cpuhz = check($tabcpuhz{$i}, 1000000);
+			$obj_cpupercent = check($tabcpupercent{$i}, 0.01);
+			}
+        	if ("@arg" =~ /host/) {
+			$obj_host = check(${$link_vm_host}{$i});
+			}
+	        if ("@arg" =~ /mem/) {
+			$obj_memmb = check($tabmemmb{$i}, 1000);
+			$obj_memswap = check($tabmemswap{$i}, 1000);	
+			}
+	        if ("@arg" =~ /cluster/) {
+			$obj_cluster = check(${$link_vm_cluster}{$i});
+			}
+
+		my $this = {"id" => $i, "name" => $obj_ip};
+		if ("@arg" =~ /cpu/) {
+			my $tmp = {"cpuhz" => $obj_cpuhz, "cpupercent" => $obj_cpupercent};
+			$this = {%$this, %$tmp};
+			}	
+		if ("@arg" =~ /mem/) {
+                        my $tmp = {"memmb" => $obj_memmb, "memswap" => $obj_memswap};
+                        $this = {%$this, %$tmp};
+                        }
+		if ("@arg" =~ /host/) {
+                        my $tmp = {"host" => $obj_host};
+                        $this = {%$this, %$tmp};
+                        }
+		if ("@arg" =~ /cluster/) {
+                        my $tmp = {"cluster" => $obj_cluster};
+                        $this = {%$this, %$tmp};
+                        }
+
+		bless ($this, $i);
+		push (@obj, $this);
+		}
+return \@obj;
+
+}
+
+sub build_host {
+
+	my (@arg) = @_;
+	my $perfMgr = Vim::get_view(mo_ref => Vim::get_service_content()->perfManager, properties => [ 'perfCounter' ]);
+	my $views_host = Vim::find_entity_views(view_type => 'HostSystem', properties => [ 'name' ]);
+	my @perf_query_spec = ();
+
+	if ("@arg" =~ /cpu/) {
+		push(@perf_query_spec, PerfQuerySpec->new(entity => $_, metricId => get_ressource($perfMgr, 'cpu', ('usagemhz.average', 'usage.average')), format => 'csv', intervalId => 20, maxSample => 1)) foreach (@$views_host);
+		}
+	if ("@arg" =~ /mem/) {
+		push(@perf_query_spec, PerfQuerySpec->new(entity => $_, metricId => get_ressource($perfMgr, 'mem', ('consumed.average', 'granted.average', 'swapused.average',  'swapin.average', 'swapout.average', 'vmmemctl.average')), format => 'csv', intervalId => 20, maxSample => 1)) foreach (@$views_host);
+		}
+	if ("@arg" =~ /net/) {
+		push(@perf_query_spec, PerfQuerySpec->new(entity => $_, metricId => get_ressource($perfMgr, 'net', ('usage.average:*', 'droppedRx.summation:*', 'droppedTx.summation:*', 'packetsRx.summation:*', 'packetsTx.summation:*', 'received.average:*', 'transmitted.average:*', 'errorsRx.summation:*', 'errorsTx.summation:*', 'broadcastRx.summation:*', 'broadcastTx.summation:*')), format => 'csv', intervalId => 20, maxSample => 1)) foreach (@$views_host);
+		}
+
+	my $perf_data, my %tabcpuhz, my %tabcpupercent, my %tabmemconsumed, my %tabmemgranted, my %tabmemswapused;
+	my %tabmemswapin, my %tabmemswapout, my %tabmemballoon;
+	my $obj_netUsage, my $obj_netDroppedRx, my $obj_netDroppedTx, my $obj_netPacketsRx, my $obj_netPacketsTx;
+        my $obj_netReceived, my $obj_netTransmitted, my $obj_netErrorsRx, my $obj_netErrorsTx, my $obj_netBroadcastRx, my $obj_netBroadcastTx;
+
+
+	if (("@arg" =~ /cpu/) || ("@arg" =~ /mem/) || ("@arg" =~ /net/)) {
+		$perf_data = $perfMgr->QueryPerf(querySpec => \@perf_query_spec);
+		}
+
+	if ("@arg" =~ /cpu/) {
+		foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {
+					if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostCpuHz'}) {
+						$tabcpuhz{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+						}
+					}
+				}
+			}
+		foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {
+					if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostCpuPercent'}) {
+						$tabcpupercent{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};	
+						}
+					}
+				}	
+			}
+		}
+	
+	if ("@arg" =~ /mem/) {
+		foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+				if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {
+					if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostRamConsumed'}){
+                	        		$tabmemconsumed{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value}; 
+                       				}
+					}
+				}
+			}
+        	foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+                		if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {   
+                        		if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostRamGranted'}){
+                                		$tabmemgranted{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+                                		}
+					}
+                       	 	}
+                	}
+        	foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+               			if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {   
+                        		if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostRamSwapused'}){
+                                		$tabmemswapused{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+                                		}
+					}
+                 	        }
+               		}
+        	foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+                		if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {   
+                        		if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostRamSwapin'}){
+                                		$tabmemswapin{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+                                		}
+					}
+                       		}
+                	}
+        	foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+                		if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {   
+                        		if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostRamSwapout'}){
+                                		$tabmemswapout{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+                                		}
+					}
+                        	}
+                	}
+        	foreach my $i (keys($perf_data)) {
+			foreach my $j (keys(${$perf_data}[$i]{value})) {
+                		if (defined(${$perf_data}[$i]{value}[$j]{id}{counterId})) {
+                        		if (${$perf_data}[$i]{value}[$j]{id}{counterId} == ${$link_counterId}{'hostRamBalloon'}){
+                                		$tabmemballoon{${$perf_data}[$i]{entity}{value}}=${$perf_data}[$i]{value}[$j]{value};
+                                		}	
+					}	
+                        	}
+                	}
+		}
+	if ("@arg" =~ /net/) {
+		$obj_netUsage = get_host_net($perf_data, ${$link_counterId}{'hostNetUsage'}, 1000);
+        	$obj_netDroppedRx = get_host_net($perf_data, ${$link_counterId}{'hostNetDroppedRx'});
+	        $obj_netDroppedTx = get_host_net($perf_data, ${$link_counterId}{'hostNetDroppedTx'});
+        	$obj_netPacketsRx = get_host_net($perf_data, ${$link_counterId}{'hostNetPacketsRx'});
+        	$obj_netPacketsTx = get_host_net($perf_data, ${$link_counterId}{'hostNetPacketsTx'});
+        	$obj_netReceived = get_host_net($perf_data, ${$link_counterId}{'hostNetReceived'}, 1000);
+        	$obj_netTransmitted = get_host_net($perf_data, ${$link_counterId}{'hostNetTransmitted'}, 1000);
+        	$obj_netErrorsRx = get_host_net($perf_data, ${$link_counterId}{'hostNetErrorsRx'});
+        	$obj_netErrorsTx = get_host_net($perf_data, ${$link_counterId}{'hostNetErrorsTx'});
+        	$obj_netBroadcastRx = get_host_net($perf_data, ${$link_counterId}{'hostNetBroadcastRx'});
+        	$obj_netBroadcastTx = get_host_net($perf_data, ${$link_counterId}{'hostNetBroadcastTx'});
+		}
+
+	my @obj;
+	foreach my $i (keys($link_host)) {
+		my $obj_cpuhz, my $obj_cpupercent, my $obj_cluster, my $obj_memconsumed, my $obj_memswapused, my $obj_memgranted;
+		my $obj_memswapin, my $obj_memswapout, my $obj_memballoon, my $obj_netusage, my $obj_netdroppedrx;
+		my $obj_netdroppedtx, my $obj_netpacketsrx, my $obj_netpacketstx, my $obj_netreceived, my $obj_nettransmitted;
+		my $obj_neterrorsrx, my $obj_neterrorstx, my $obj_netbroadcastrx, my $obj_netbroadcasttx;	
+		
+		my $obj_id = check($i);
+		my $obj_ip = check(${$link_host}{$i});
+		if ("@arg" =~ /cpu/) {
+			$obj_cpuhz = check($tabcpuhz{$i}, 1000000);
+			$obj_cpupercent = check($tabcpupercent{$i}, 0.01);
+			}
+		if ("@arg" =~ /cluster/) {
+			$obj_cluster = check(${$link_host_cluster}{$i});
+			}
+		if ("@arg" =~ /mem/) {
+			$obj_memconsumed = check($tabmemconsumed{$i}, 1000);
+			$obj_memswapused = check($tabmemswapused{$i}, 1000);
+			$obj_memgranted = check($tabmemgranted{$i}, 1000);
+			$obj_memswapin = check($tabmemswapin{$i}, 1000);
+			$obj_memswapout = check($tabmemswapout{$i}, 1000);
+			$obj_memballoon = check($tabmemballoon{$i}, 1000);
+			}
+		if ("@arg" =~ /net/) {
+			$obj_netusage = check(host_net_sub($obj_netUsage,$i));
+			$obj_netdroppedrx = check(host_net_sub($obj_netDroppedRx, $i));
+			$obj_netdroppedtx = check(host_net_sub($obj_netDroppedTx, $i));
+       		        $obj_netpacketsrx = check(host_net_sub($obj_netPacketsRx, $i));
+	                $obj_netpacketstx = check(host_net_sub($obj_netPacketsTx, $i));
+	                $obj_netreceived = check(host_net_sub($obj_netReceived, $i));
+	                $obj_nettransmitted = check(host_net_sub($obj_netTransmitted, $i));
+	                $obj_neterrorsrx = check(host_net_sub($obj_netErrorsRx, $i));
+	                $obj_neterrorstx = check(host_net_sub($obj_netErrorsTx, $i));
+	                $obj_netbroadcastrx = check(host_net_sub($obj_netBroadcastRx, $i));
+	                $obj_netbroadcasttx = check(host_net_sub($obj_netBroadcastTx, $i));
+			}
+	
+		my $this = {"id", $i, "name", $obj_ip};
+		     
+		if ("@arg" =~ /cpu/) {
+                        my $tmp = {"cpuhz" => $obj_cpuhz, "cpupercent" => $obj_cpupercent};
+                        $this = {%$this, %$tmp};
+                        }
+		if ("@arg" =~ /mem/) {
+                        my $tmp = {"memgranted", $obj_memgranted, "memconsumed", $obj_memconsumed, "memswapused", $obj_memswapused, "memswapin", $obj_memswapin, "memswapout", $obj_memswapout, "memballoon", $obj_memballoon};
+                        $this = {%$this, %$tmp};
+                        }
+		if ("@arg" =~ /cluster/) {
+                        my $tmp = {"cluster", $obj_cluster};
+                        $this = {%$this, %$tmp};
+                        }
+		if ("@arg" =~ /net/) {
+                        my $tmp = {"netusage", $obj_netusage, "netdroppedrx", $obj_netdroppedrx, "netdroppedtx", $obj_netdroppedtx, "netpacketsrx", $obj_netpacketsrx, "netpacketstx", $obj_netpacketstx, "netreceived", $obj_netreceived, "nettransmitted", $obj_nettransmitted, "neterrorsrx", $obj_neterrorsrx, "neterrorstx", $obj_neterrorstx, "netbroadcastrx", $obj_netbroadcastrx, "netbroadcasttx", $obj_netbroadcasttx};
+                        $this = {%$this, %$tmp};
+                        }
+
+  		bless ($this, $i);
+		push (@obj, $this);
+		}
+return \@obj;
+
+}
+
+sub build_datastore { #IMPORTANT ! activer Storage I/O Control pour chacun des datastores pour récolter les données de performances
+	
+	my (@arg) = @_;	
+	my $perfMgr = Vim::get_view(mo_ref => Vim::get_service_content()->perfManager, properties => [ 'perfCounter' ]);
+        my $perf_data, my @perf_query_spec = ();
+	
+	my $datastore_view = Vim::find_entity_views(view_type => 'Datastore', properties => ['name', 'summary']);
+	
+	if ("@arg" =~ /perf/) {
+		my $host_view = Vim::find_entity_views(view_type => 'HostSystem', properties => ['name']);
+		push(@perf_query_spec, PerfQuerySpec->new(entity => $_, metricId => get_ressource($perfMgr, 'datastore', ('datastoreIops.average:*', 'totalReadLatency.average:*', 'totalWriteLatency.average:*')), format => 'csv', intervalId => 20, maxSample => 1)) foreach (@$host_view);
+		$perf_data = $perfMgr->QueryPerf(querySpec => \@perf_query_spec);
+		}
+
+        my %tabdatastore, my %tabcapacity, my %tabfreespace, my %tabname;
+	my $dIops, my $dWriteLatency, my $dReadLatency;
+	my $obj_iops, my $obj_WriteLatency, my $obj_ReadLatency, my $obj_TotalLatency;
+	my $obj_capacity, my $obj_freespace, my $obj_usedspace;	
+	
+	foreach my $i (keys($datastore_view)) {
+		my $var = ${$datastore_view}[$i]{summary}{url};
+		my $tmp = substr($var,0 , (length($var) - 1));
+		while (index($tmp, "/") != -1) {
+			$tmp = substr($tmp, index($tmp, "/") + 1, length($tmp));
+			}	
+           	$tabdatastore{$tmp}=${$datastore_view}[$i]{mo_ref}{value};
+		
+		$tabname{${$datastore_view}[$i]{mo_ref}{value}}=${$datastore_view}[$i]{name};
+		$tabcapacity{${$datastore_view}[$i]{mo_ref}{value}}=${$datastore_view}[$i]{summary}{capacity};
+		$tabfreespace{${$datastore_view}[$i]{mo_ref}{value}}=${$datastore_view}[$i]{summary}{freeSpace};
+		}
+
+	if ("@arg" =~ /perf/) {
+		$dIops = get_datastore_perf($perf_data, ${$link_counterId}{'datastoreIops'}, %tabdatastore);
+		$dWriteLatency = get_datastore_perf($perf_data, ${$link_counterId}{'datastoreWriteLatency'}, %tabdatastore);
+		$dReadLatency = get_datastore_perf($perf_data, ${$link_counterId}{'datastoreReadLatency'}, %tabdatastore);
+		}
+
+	my @obj;
+	foreach my $i (values(%tabdatastore)) {
+		my $obj_id = $i;
+		my $obj_name = $tabname{$i};
+		if ("@arg" =~ /state/) {
+			$obj_capacity = int($tabcapacity{$i});
+			$obj_freespace = int($tabfreespace{$i});
+			$obj_usedspace = $obj_capacity - $obj_freespace;
+			}
+		if ("@arg" =~ /perf/) {
+			$obj_WriteLatency = ${$dWriteLatency}{$i};
+			$obj_ReadLatency = ${$dReadLatency}{$i};
+			$obj_iops = ${$dIops}{$i};
+			$obj_TotalLatency = $NAN;	
+
+			if (!defined(${$dWriteLatency}{$i})) { 
+				$obj_WriteLatency = 0;
+				}
+			if (!defined(${$dReadLatency}{$i})) {
+                       		$obj_ReadLatency = 0;
+                        	}
+			if (!defined(${$dIops}{$i})) {
+                        	$obj_iops = 0;
+                        	}
+			if (($obj_ReadLatency ne $NAN) && ($obj_WriteLatency ne $NAN)) {
+				$obj_TotalLatency = $obj_ReadLatency + $obj_WriteLatency;
+				}
+			}
+
+		my $this = {"id", $obj_id, "name", $obj_name};
+		if ("@arg" =~ /perf/) {
+                        my $tmp = {"iops", $obj_iops, "writelatency", $obj_WriteLatency, "readlatency", $obj_ReadLatency, "totallatency", $obj_TotalLatency};
+                        $this = {%$this, %$tmp};
+                        }
+		if ("@arg" =~ /state/) {
+                        my $tmp = {"capacity", $obj_capacity, "freespace", $obj_freespace, "usedspace", $obj_usedspace};
+                        $this = {%$this, %$tmp};
+                        }
+
+		bless ($this, $i);
+		push (@obj, $this);
+		}	
+	return \@obj;
+}
+
+sub get_datastore_perf { #fonction qui permet de récupérer les informations Perfs des datastores en fonction du CounterId (identifiant d'un type de compteur)
+        my ($perf_data, $counterId, %datastore_id) = @_;
+        my @obj;
+	my %tab;
+
+	if ($counterId eq $NAN) {
+		foreach my $i (values(%datastore_id)) {
+			$tab{$i} = $NAN;
+			}		
+		}
+	else {
+        	foreach my $i (keys($perf_data)) {
+                	my @uniqueObj;
+                	foreach my $j (keys(${$perf_data}[$i]{value})){
+                        	if (${$perf_data}[$i]{value}[$j]{id}{counterId} == $counterId) {
+                                	my $instance = ${$perf_data}[$i]{value}[$j]{id}{instance};
+					my $id_datastore;
+					foreach my $k (keys(%datastore_id)){
+						if ($k eq $instance) { $id_datastore = $datastore_id{$k}; }
+						}
+                                	my $this = {"id",$id_datastore , "value", ${$perf_data}[$i]{value}[$j]{value}};
+                                	bless ($this, $id_datastore);
+                                	push (@uniqueObj, $this);
+                                	}
+                        	}
+                	my $this = {'datastore', \@uniqueObj};
+                	bless ($this, ${$perf_data}[$i]{entity}{value});
+                	push (@obj, $this);
+                	}
+		foreach my $i (keys(@obj)) {
+ 			my %tmptab;	
+			foreach my $j (@{${$obj[$i]}{datastore}}) {
+				$tmptab{${$j}{id}}=${$j}{value};
+				}	
+			@tab{keys %tmptab} = values %tmptab;	
+			}
+		}
+	return \%tab;
+}
+
+sub get_ressource { #fonction permettant de récupérer des CounterID de performances pour les hôtes et VMs
+
+        my ($perfmgr_view, $group, @names) = @_;
+        my $perfCounterInfo = $perfmgr_view->perfCounter;
+        my @counters;
+        foreach (@$perfCounterInfo) {
+                if ($_->groupInfo->key eq $group) {
+                        my $cur_name = $_->nameInfo->key . "." . $_->rollupType->val;
+                        foreach my $index (0..@names-1){
+                                if ($names[$index] =~ /$cur_name/){
+                                        $names[$index] =~ /(\w+).(\w+):*(.*)/;
+                                        $counters[$index] = PerfMetricId->new(counterId => $_->key, instance => $3);
+                                        }
+                                }
+                        }
+                }
+        return \@counters;
+}
+
+sub get_index { #fonction permettant de récupérer des CounterID de performances pour les hôtes et VMs
+
+        my ($perfmgr_view, $group, @names) = @_;
+        my $perfCounterInfo = $perfmgr_view->perfCounter;
+        my $counters;
+        foreach (@$perfCounterInfo) {
+                if ($_->groupInfo->key eq $group) {
+                        my $cur_name = $_->nameInfo->key . "." . $_->rollupType->val;
+                        foreach my $index (0..@names-1){
+                                if ($names[$index] =~ /$cur_name/){
+                                        $names[$index] =~ /(\w+).(\w+):*(.*)/;
+                                        $counters = $_->key;
+                                        }
+                                }
+                        }
+                }
+        return $counters;
+}
+
+
+sub get_host_net {  #fonction qui permet de récupérer les informations NET des Hôtes en fonction du CounterId (identifiant d'un type de compteur)
+	my ($perf_data, $counterId, $multiplier) = @_;
+	my @obj;
+	
+	foreach my $i (keys($perf_data)) {
+                my @uniqueObj_net;
+	 	my $check = 0;	
+		if ($counterId eq $NAN) {
+                	my $this = {${$perf_data}[$i]{entity}{value}, $NAN};
+                	bless ($this, ${$perf_data}[$i]{entity}{value});
+                	push (@obj, $this);
+               		}
+		else {
+                	foreach my $j (keys(${$perf_data}[$i]{value})){
+				if ((${$perf_data}[$i]{value}[$j]{id}{counterId} == $counterId)) {
+					my $instance = ${$perf_data}[$i]{value}[$j]{id}{instance};
+					my $value = ${$perf_data}[$i]{value}[$j]{value};
+					if (defined $multiplier) { $value *= 1000; }
+                                	if ($instance eq '') { $instance = "All"; }
+                                	my $this = {"id", $instance, "value", $value};
+                                	bless ($this, $instance);
+                                	push (@uniqueObj_net, $this);
+                               		$check = 1;
+					}
+				}
+			if ($check == 1) {
+                		my $this = {${$perf_data}[$i]{entity}{value}, \@uniqueObj_net};
+                		bless ($this, ${$perf_data}[$i]{entity}{value});
+                		push (@obj, $this);
+				}
+                	}
+		}
+	return \@obj;
+}
+
+sub host_net_sub { #fonction qui permet de récupérer l'information NET créé précédemment d'un hôte
+        my ($obj_net, $i) = @_;
+        foreach my $j (@$obj_net) {
+		if (defined(${$j}{$i})) {	
+			return ${$j}{$i};	
+			}
+		}
+}
+
+sub link_check {
+	
+	my ($value) = @_;
+	my $return;
+
+	if (!defined($value)) {
+		$return = $NAN;
+		}
+	else {
+		$return = $value;
+		}
+	return $return;
+}
+
+sub check {
+
+        my ($value, $reducer) = @_;
+        my $return;
+
+        if (!defined($value)) {
+                $return = $NAN;
+                }
+        else {
+		if (defined($reducer)) {
+			$value =~ tr/,/./;
+			$return = int($value*$reducer);
+			}
+		else {
+                	$return = $value;
+			}
+                }
+        return $return;
+}
+
+sub build_link_host {
+
+	my %tabhostname;
+        my $host_views = Vim::find_entity_views(view_type => 'HostSystem', properties => ['name']);
+
+        foreach my $i (keys($host_views)) {
+                $tabhostname{${$host_views}[$i]{'mo_ref'}{value}} = ${$host_views}[$i]{name};
+                }
+	return \%tabhostname;
+}
+
+sub build_link_host_cluster {
+
+        my $cluster_views = Vim::find_entity_views(view_type => 'ClusterComputeResource', properties => ['name']);
+        my %tabclustername;
+        foreach my $i (keys($cluster_views)) {
+                $tabclustername{${$cluster_views}[$i]{name}}=$i;
+                }
+        my %tabclusterhost;
+        foreach my $i (keys(%tabclustername)) {
+                my $cluster_view = Vim::find_entity_view(view_type => 'ClusterComputeResource', filter => { name => $i }, properties => ['name']);
+                my $host_views = Vim::find_entity_views(view_type => 'HostSystem', begin_entity => $cluster_view, properties => ['name', 'runtime.powerState']);
+                foreach my $j (keys($host_views)) {
+                        $tabclusterhost{${$host_views}[$j]{mo_ref}{value}} = $i;
+                        }
+                }
+	return \%tabclusterhost;
+}
+
+sub build_link_vm {
+
+	my %tabvm;
+	my $views_vm = Vim::find_entity_views(view_type => 'VirtualMachine', filter => {'runtime.powerState' => 'poweredOn'}, properties => [ 'name', 'runtime.host' ]);
+
+        foreach my $i (keys($views_vm)) {
+                $tabvm{${$views_vm}[$i]{mo_ref}{value}} = ${$views_vm}[$i]{name};
+                }
+	return \%tabvm;	
+}
+
+sub build_link_vm_host {
+	
+        my %tabhostname;
+        my $host_views = Vim::find_entity_views(view_type => 'HostSystem', properties => ['name']);
+	my $views_vm = Vim::find_entity_views(view_type => 'VirtualMachine', filter => {'runtime.powerState' => 'poweredOn'}, properties => [ 'name', 'runtime.host' ]);
+
+        foreach my $i (keys($host_views)) {
+                $tabhostname{${$host_views}[$i]{'mo_ref'}{value}} = ${$host_views}[$i]{name};
+                }               
+        my %tabhost;    
+        foreach my $i (keys($views_vm)) {
+                foreach my $j (keys(%tabhostname)) {
+                        if (${$views_vm}[$i]{'runtime.host'}{value} eq $j) {
+                                $tabhost{${$views_vm}[$i]{mo_ref}{value}} = $tabhostname{$j};
+                                }
+                        }
+                }
+	return \%tabhost;
+}
+
+sub build_link_vm_cluster {
+	
+	my $views_vm = Vim::find_entity_views(view_type => 'VirtualMachine', filter => {'runtime.powerState' => 'poweredOn'}, properties => [ 'name', 'runtime.host' ]);	
+	my %tabhost;
+        my %tabhostname;
+        my $host_views = Vim::find_entity_views(view_type => 'HostSystem', properties => ['name']);
+
+        foreach my $i (keys($host_views)) {
+                $tabhostname{${$host_views}[$i]{'mo_ref'}{value}} = ${$host_views}[$i]{name};
+                }
+	
+	foreach my $i (keys($views_vm)) {
+                foreach my $j (keys(%tabhostname)) {
+                        if (${$views_vm}[$i]{'runtime.host'}{value} eq $j) {
+                                $tabhost{${$views_vm}[$i]{mo_ref}{value}} = $tabhostname{$j};
+                                }
+                        }
+                }
+
+        my $cluster_views = Vim::find_entity_views(view_type => 'ClusterComputeResource', properties => ['name']);
+        my %tabclustername;
+        foreach my $i (keys($cluster_views)) {
+                $tabclustername{${$cluster_views}[$i]{name}}=$i;
+                }
+
+        my %tabclusterhost;
+        foreach my $i (keys(%tabclustername)) {
+                my $cluster_view = Vim::find_entity_view(view_type => 'ClusterComputeResource', filter => { name => $i }, properties => ['name']);
+                my $host_views = Vim::find_entity_views(view_type => 'HostSystem', begin_entity => $cluster_view, properties => ['name', 'runtime.powerState']);
+                   foreach my $j (keys($host_views)) {
+                        foreach my $k (keys(%tabhost)) {
+                                if (${$host_views}[$j]{name} eq $tabhost{$k}) {
+                                        $tabclusterhost{$k} = $i;
+                                        }
+                                }
+                        }
+                }
+	return \%tabclusterhost;
+}
+
+sub build_link_CounterId {
+	
+	my %linktab;
+	my $perfMgr = Vim::get_view(mo_ref => Vim::get_service_content()->perfManager, properties => [ 'perfCounter' ]);
+	
+	###datastore
+	$linktab{"datastoreIops"} = link_check(get_index($perfMgr, 'datastore', ('datastoreIops.average')));
+        $linktab{"datastoreWriteLatency"} = link_check(get_index($perfMgr, 'datastore', ('totalWriteLatency.average')));
+        $linktab{"datastoreReadLatency"} = link_check(get_index($perfMgr, 'datastore', ('totalReadLatency.average')));
+	###vm
+	$linktab{"vmCpuHz"} = link_check(get_index($perfMgr, 'cpu', ('usagemhz.average')));
+        $linktab{"vmCpuPercent"} = link_check(get_index($perfMgr, 'cpu', ('usage.average')));
+        $linktab{"vmRamConsumed"} = link_check(get_index($perfMgr, 'mem', ('consumed.average')));
+        $linktab{"vmRamSwapped"} = link_check(get_index($perfMgr, 'mem', ('swapped.average')));	
+	###host
+        $linktab{"hostCpuHz"} = link_check(get_index($perfMgr, 'cpu', ('usagemhz.average')));
+        $linktab{"hostCpuPercent"} = link_check(get_index($perfMgr, 'cpu', ('usage.average')));	
+        $linktab{"hostRamConsumed"} = link_check(get_index($perfMgr, 'mem', ('consumed.average')));
+        $linktab{"hostRamGranted"} = link_check(get_index($perfMgr, 'mem', ('granted.average')));
+        $linktab{"hostRamSwapused"} = link_check(get_index($perfMgr, 'mem', ('swapused.average')));
+        $linktab{"hostRamSwapin"} = link_check(get_index($perfMgr, 'mem', ('swapin.average')));
+        $linktab{"hostRamSwapout"} = link_check(get_index($perfMgr, 'mem', ('swapout.average')));
+        $linktab{"hostRamBalloon"} = link_check(get_index($perfMgr, 'mem', ('vmmemctl.average')));
+        $linktab{"hostNetUsage"} = link_check(get_index($perfMgr, 'net', ('usage.average:*')));
+        $linktab{"hostNetDroppedRx"} = link_check(get_index($perfMgr, 'net', ('droppedRx.summation:*')));
+        $linktab{"hostNetDroppedTx"} = link_check(get_index($perfMgr, 'net', ('droppedTx.summation:*')));
+        $linktab{"hostNetPacketsRx"} = link_check(get_index($perfMgr, 'net', ('packetsRx.summation:*')));
+        $linktab{"hostNetPacketsTx"} = link_check(get_index($perfMgr, 'net', ('packetsTx.summation:*')));
+        $linktab{"hostNetReceived"} = link_check(get_index($perfMgr, 'net', ('received.average:*')));
+        $linktab{"hostNetTransmitted"} = link_check(get_index($perfMgr, 'net', ('transmitted.average:*')));
+        $linktab{"hostNetErrorsTx"} = link_check(get_index($perfMgr, 'net', ('errorsTx.summation:*')));
+        $linktab{"hostNetErrorsRx"} = link_check(get_index($perfMgr, 'net', ('errorsRx.summation:*')));
+        $linktab{"hostNetBroadcastRx"} = link_check(get_index($perfMgr, 'net', ('broadcastRx.summation:*')));
+        $linktab{"hostNetBroadcastTx"} = link_check(get_index($perfMgr, 'net', ('broadcastTx.summation:*')));
+
+	return \%linktab;
+}
+
+sub dump_refresh {
+	my ($dump_file, $delay) = @_;
+	my $refresh;
+	
+	if (-e $dump_file) {
+        my $file_epoch = `stat -c %Y $dump_file`;
+        if ((time - $file_epoch) >= $delay) { $refresh = 1; }
+	else { $refresh = 0; }
+        } else {
+        	$refresh = 1;
+        }
+	return $refresh;
+}
+
+sub get_vm_log {
+	my %tabhostname;
+	my %tabhoststatus;
+        my $host_views = Vim::find_entity_views(view_type => 'HostSystem', properties => ['name', 'triggeredAlarmState']);
+        my $views_vm = Vim::find_entity_views(view_type => 'VirtualMachine', properties => [ 'name', 'runtime.host', 'runtime.powerState', 'triggeredAlarmState' ]);
+	my $alarmMgr = Vim::get_view(mo_ref => Vim::get_service_content()->alarmManager);
+        my @vmStatusObj;
+	my @hostStatusObj;
+
+	foreach my $vm (@$views_vm)
+        {
+           if (!defined($vm->triggeredAlarmState)) { push (@vmStatusObj, bless ({"vmid", $NAN, "vmstatus", $NAN, "vmdesc", $NAN}, ${$vm}{mo_ref}{value})); }   
+           	next if(!defined($vm->triggeredAlarmState));
+           	foreach(@{$vm->triggeredAlarmState}) {
+                	my $alarm = Vim::get_view(mo_ref => $_->alarm);
+        		my $vmid = ${$vm}{mo_ref}{value};
+			my $vmstatus = $_->overallStatus->val;
+			my $vmdesc = $alarm->info->name;        
+			my $this = { "vmid", $vmid, "vmstatus", $vmstatus, "vmdesc", $vmdesc };
+			bless ($this, $vmid);
+			push (@vmStatusObj, $this);
+           		}
+       		}
+	foreach my $host (@$host_views)
+        {
+           if (!defined($host->triggeredAlarmState)) { push (@hostStatusObj, bless ({"hostid", $NAN, "hoststatus", $NAN, "hostdesc", $NAN}, ${$host}{mo_ref}{value})); }
+                next if(!defined($host->triggeredAlarmState));
+                foreach(@{$host->triggeredAlarmState}) {
+                        my $alarm = Vim::get_view(mo_ref => $_->alarm);
+                        my $hostid = ${$host}{mo_ref}{value};
+                        my $hoststatus = $_->overallStatus->val;
+                        my $hostdesc = $alarm->info->name;
+                        my $this = { "hostid", $hostid, "hoststatus", $hoststatus, "hostdesc", $hostdesc };
+                        bless ($this, $hostid);
+                        push (@hostStatusObj, $this);
+                        }
+                }
+
+        foreach my $i (keys($host_views)) {
+                $tabhostname{${$host_views}[$i]{'mo_ref'}{value}} = ${$host_views}[$i]{name};
+                }
+
+	foreach my $i (keys($host_views)) {
+		$tabhoststatus{${$host_views}[$i]{'mo_ref'}{value}} = ${$host_views}[$i]{overallStatus}{val};
+		}
+
+	my $cluster_views = Vim::find_entity_views(view_type => 'ClusterComputeResource', properties => ['name']);
+        my %tabclustername;
+        foreach my $i (keys($cluster_views)) {
+                $tabclustername{${$cluster_views}[$i]{name}}=$i;
+                }
+        my %tabclusterhost;
+        foreach my $i (keys(%tabclustername)) {
+                my $cluster_view = Vim::find_entity_view(view_type => 'ClusterComputeResource', filter => { name => $i }, properties => ['name']);
+                my $host_v = Vim::find_entity_views(view_type => 'HostSystem', begin_entity => $cluster_view, properties => ['name', 'runtime.powerState']);
+                foreach my $j (keys($host_v)) {
+                        $tabclusterhost{${$host_v}[$j]{mo_ref}{value}} = $i;
+                        }
+                }
+
+	my @obj;
+        foreach my $i (keys($views_vm)) {
+                foreach my $j (keys(%tabhostname)) {
+                        if (${$views_vm}[$i]{'runtime.host'}{value} eq $j) {
+                                my $id = ${$views_vm}[$i]{mo_ref}{value};
+				my $name = ${$views_vm}[$i]{name};
+				my $hostid = ${$views_vm}[$i]{'runtime.host'}{value};
+				my $hostname = $tabhostname{$j};
+				my $state = ${$views_vm}[$i]{'runtime.powerState'}{'val'};
+				my $cluster;	
+				
+				foreach my $k (keys %tabclusterhost) {
+					if ($k eq $hostid) {
+						$cluster = $tabclusterhost{$k};	
+						}
+					}
+				my @status;
+				my @hoststatus;
+				
+				foreach my $vmstatus (@vmStatusObj) {
+					if (${$vmstatus}{vmid} eq $id) {
+						my $this = {"vmstatus", ${$vmstatus}{vmstatus}, "vmdesc", ${$vmstatus}{vmdesc}};
+						bless ($this, $id);
+						push (@status, $this);
+						}
+					}
+				foreach my $hosts (@hostStatusObj) {
+                                        if (${$hosts}{hostid} eq $hostid) {
+                                                my $this = {"hoststatus", ${$hosts}{hoststatus}, "hostdesc", ${$hosts}{hostdesc}};
+                                                bless ($this, $id);
+                                                push (@hoststatus, $this);
+                                                }
+                                        }				
+				if (!defined $status[0]) { @status = bless({'vmstatus', $NAN, 'vmdesc', $NAN}, $id); }
+				if (!defined $hoststatus[0]) { @hoststatus = bless({'hoststatus', $NAN, 'hostdesc', $NAN}, $id); }
+		
+				my $this = {"id", $id, "name", $name, "hostid", $hostid, "hostname", $hostname, "state", $state, "cluster", $cluster, "status", \@status, "hoststatus", \@hoststatus};
+				bless ($this, $id);
+				push (@obj, $this);
+				}
+                        }
+                }
+        return \@obj;
+}
+
+sub path_arg {
+	my ($opts, $file) = @_;
+	my $path = "/tmp/".$file;
+
+	if (defined $opts && -d $opts) {
+		my $tmp = $opts;
+		if (chop($tmp) ne "/") { $opts .= "/"; }
+		$path = $opts.$file;
+		} 
+	return $path;
+}
+
+sub usage {
+
+        print "========================================PLUGIN ESX==========================================\n";
+	print "===================================Liste des arguments======================================\n";
+	print "=========================================Requis=============================================\n\n";
+	print "--address      		Adresse Ip de l'ESX (VCenter) que l'ont souhaite interroger	   \n";
+	print "--user         		Nom de l'utilisateur pouvant se connecter au VCenter		   \n";
+	print "--password     		Mot de passe de l'utilisateur					 \n\n";
+	print "========================================Optionnel=========================================\n\n";
+	print "--force 			Force le rafraîchissement des fichiers de liens.\n";
+	print "--nan	      		Défini la valeur de retour en cas de non résultat d'une requête de performance (par défaut 'NaN').\n";
+	print "--refresh      		Défini l'intervalle de temps (en secondes) entre chaque rafraichissement des fichiers de liens (3600 sec., 1H par défaut).\n\n";
+	print "	=== === ===  Chemin de fichier de résultats et de liens (PAR DEFAUT /tmp/)  === === ===  \n\n";
+	print "--path-datastore	        Défini le chemin du répertoire où sera créé le fichier de résultats du requêtage sur les Datastores.\n";
+	print "--path-vm		Défini le chemin du répertoire où sera créé le fichier de résultats du requêtage sur les VMs.\n";
+	print "--path-host		Défini le chemin du répertoire où sera créé le fichier de résultats du requêtage sur les hôtes ESX.\n";
+	print "--counterid		Défini le chemin du répertoire où sera créé le fichier de liens des requêtes de performances et de leur ID.\n";
+	print "--link-host		Défini le chemin du répertoire où sera créé le fichier de liens des HostID et des Hostnames.\n";
+	print "--link-host-cluster	Défini le chemin du répertoire où sera créé le fichier de liens des Clusters pour chacun des hôtes ESX.\n";
+	print "--link-vm		Défini le chemin du répertoire où sera créé le fichier de liens des VmID et des VMnames.\n";
+	print "--link-vm-cluster	Défini le chemin du répertoire où sera créé le fichier de liens des Clusters pour chacunes des VMs.\n";
+	print "--link-vm-host		Défini le chemin du répertoire où sera créé le fichier de liens des VMs pour chacun des hôtes ESX.\n\n";
+	print " === === === === === ===  Filtre des performances à rechercher  === === === === === ===\n\n";
+	print "--host-arg		Défini la liste des types de performances qui vont être requêter sur les hôtes.\n";
+	print "			        SYNTHAXE : --host-arg valeur1 valeur2 etc.\n";
+	print "			        PAR DEFAUT : --host-arg cpu mem net cluster (toutes les valeurs)   \n";
+	print "--vm-arg                 Défini la liste des types de performances qui vont être requêter sur les VMs.\n";
+        print "                         SYNTHAXE : --vm-arg valeur1 valeur2 etc.                           \n";
+        print "                         PAR DEFAUT : --vm-arg cpu mem host cluster (toutes les valeurs)    \n";
+	print "--datastore-arg          Défini la liste des types de performances qui vont être requêter sur les datastores.\n";
+        print "                         SYNTHAXE : --datastore-arg valeur1 valeur2 etc.                    \n";
+        print "                         PAR DEFAUT : --datastore-arg state perf (toutes les valeurs)       \n";        	
+
+	exit;
+}
+
+sub cleanup {
+        my ($dpvm, $dphost, $dpds, $dptime, $dplog, $dpcounter, $dplhost, $dplhostcluster, $dplvm, $dplvmhost, $dplvmcluster) = @_;
+        if (-e $dpcounter) { unlink($dpcounter); }
+        if (-e $dplhost) { unlink($dplhost); }
+        if (-e $dplhostcluster) { unlink($dplhostcluster); }
+        if (-e $dplvm) { unlink($dplvm); }
+        if (-e $dplvmhost) { unlink($dplvmhost); }
+        if (-e $dplvmcluster) { unlink($dplvmcluster); }
+        if (-e $dpvm.".lock") { unlink($dpvm.".lock"); }
+        if (-e $dpvm.".dump") { unlink($dpvm.".dump"); }
+        if (-e $dphost.".lock") { unlink($dphost.".lock"); }
+        if (-e $dphost.".dump") { unlink($dphost.".dump"); }
+        if (-e $dpds.".lock") { unlink($dpds.".lock"); }
+        if (-e $dpds.".dump") { unlink($dpds.".dump"); }
+        if (-e $dptime.".lock") { unlink($dptime.".lock"); }
+        if (-e $dptime.".dump") { unlink($dptime.".dump"); }
+        if (-e $dplog.".lock") { unlink($dplog.".lock"); }
+        if (-e $dplog.".dump") { unlink($dplog.".dump"); }
+}
+
